@@ -6,3 +6,4 @@ pandas
 json
 requests
 placekey
+TIGER/Line Shapefiles for chicago tract data from census.gov
