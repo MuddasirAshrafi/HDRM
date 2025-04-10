@@ -11,4 +11,3 @@ Road Closure Analysis: Map real-time road closures to geospatial nodes and asses
 Route Optimization: Calculate original and alternative routes for customers affected by road closures.
 Store Accessibility Insights: Map store locations to census tract centroids and provide metrics for customer reachability.
 Interactive Visualization: Generate detailed maps using Folium to visualize road closures, routes, and store visitation patterns.
-NOTE: "The project is still under development"
