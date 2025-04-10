@@ -1,249 +1,166 @@
-import osmnx as ox
-import networkx as nx
+import os
 import folium
-import geopandas as gpd
-import pandas as pd
 import json
-import requests
-import placekey as pk
-from datetime import datetime
-# OSRM API Base URL
-OSRM_BASE_URL = "http://router.project-osrm.org/route/v1/driving"
+import pandas as pd
+import networkx as nx
+import osmnx as ox
+import geopandas as gpd
+from tqdm import tqdm
 
-# Load preprocessed data
+# Configure environment
+os.environ["SHAPE_RESTORE_SHX"] = "YES"
 
-
-def load_road_network(file_path="road_network.graphml"):
-    print("Loading road network...")
-    return ox.load_graphml(filepath=file_path)
-
-
-def load_closure_nodes(file_path="closure_nodes.json"):
-    print("Loading closure nodes...")
-    with open(file_path, "r") as f:
-        return json.load(f)
+# Configuration
+ROAD_NETWORK_FILE = "road_network.graphml"
+CLOSURE_FILE = "closure_nodes.json"
+OUTPUT_MAP = "roundtrip_routes.html"
+OUTPUT_EXCEL = "roundtrip_results.xlsx"
 
 
-# Step 1: Load Census Tract Shapefile
-tract_shapefile = "HDRM/tl_2018_17_tract.shp"
-tract_data = gpd.read_file(tract_shapefile)
-tract_data['GEOID'] = tract_data['GEOID'].astype(str)
+def load_data():
+    print("Loading data...")
+    road_network = ox.load_graphml(ROAD_NETWORK_FILE)
 
-# Step 2: Extract Placekeys and GEOIDs from CSV
-file_path = "HDRM/2018_1_inverted_tractPlacekey_justChicagoBoth.csv"
-data = pd.read_csv(file_path)
-geoids = data['tract'].astype(str)
-placekeys = [col for col in data.columns if '@' in col]
+    with open(CLOSURE_FILE) as f:
+        closures = json.load(f)
 
-# Step 3: Convert Placekeys to Latitude/Longitude
-placekey_coords = []
-for placekey in placekeys:
-    try:
-        lat, lon = pk.placekey_to_geo(placekey)
-        placekey_coords.append(
-            {"Placekey": placekey, "Latitude": lat, "Longitude": lon})
-    except Exception as e:
-        print(f"Failed to convert Placekey {placekey}: {e}")
-placekey_df = pd.DataFrame(placekey_coords)
+    tract_data = gpd.read_file(
+        r'C:\Users\Muddasir\OneDrive\Desktop\sshkeys\tl_2018_17_tract_3\tl_2018_17_tract.shp')
+    tract_data['GEOID'] = tract_data['GEOID'].astype(str)
 
-# Load preprocessed road network and closure nodes
-road_network = load_road_network("road_network.graphml")
-closure_nodes = load_closure_nodes("closure_nodes.json")
+    placekeys = pd.read_csv(
+        r"C:\Users\Muddasir\OneDrive\Desktop\sshkeys\Project\data\2018_1_inverted_tractPlacekey_justChicagoBoth.csv")
 
-# Initialize map
-m = folium.Map(location=[placekey_df["Latitude"].mean(),
-               placekey_df["Longitude"].mean()], zoom_start=13)
+    return road_network, closures, tract_data, placekeys
 
-# Step 8: Process Each GEOID and Placekey
-n = 1  # Number of pairs to iterate
-for geoid in geoids[:n]:
-    print(f"Processing GEOID: {geoid}")
 
-    # Highlight GEOID area and centroid
-    tract_row = tract_data[tract_data['GEOID'] == geoid]
-    if tract_row.empty:
-        print(f"GEOID {geoid} not found in shapefile. Skipping...")
-        continue
+def get_centroid(tract_row):
+    tract_mercator = tract_row.to_crs(epsg=3857)
+    centroid = tract_mercator.geometry.centroid.iloc[0]
+    return gpd.GeoSeries([centroid], crs="EPSG:3857").to_crs(epsg=4326).iloc[0]
 
-    tract_row = tract_row.to_crs(epsg=3857)  # Reproject to Web Mercator
-    centroid = tract_row.geometry.centroid.iloc[0]  # Calculate centroid
-    centroid_coords = gpd.GeoSeries(
-        [centroid], crs="EPSG:3857").to_crs(epsg=4326).iloc[0]
-    centroid_lat, centroid_lon = centroid_coords.y, centroid_coords.x
 
-    folium.GeoJson(
-        tract_row.geometry.to_crs(epsg=4326).iloc[0],
-        style_function=lambda x: {'color': 'blue',
-                                  'weight': 2, 'fillOpacity': 0.3},
-        name=f"GEOID: {geoid}"
-    ).add_to(m)
-    folium.Marker(
-        location=(centroid_lat, centroid_lon),
-        popup=f"GEOID {geoid} Centroid",
-        icon=folium.Icon(color="blue")
-    ).add_to(m)
+def calculate_route_metrics(graph, route):
+    total_distance = 0
+    total_duration = 0
 
-    # Loop through each placekey
-    for _, row in placekey_df.iloc[:n].iterrows():
-        point_a = (centroid_lat, centroid_lon)
-        point_b = (row["Latitude"], row["Longitude"])
+    for u, v in zip(route[:-1], route[1:]):
+        edge_data = graph.get_edge_data(u, v)[0]
+        length = edge_data.get('length', 0)
+        speed = edge_data.get('speed', 50)
+        total_distance += length
+        total_duration += (length / 1000) / (speed / 60)
 
-        folium.Marker(
-            location=point_b,
-            popup=f"Placekey: {row['Placekey']}",
-            icon=folium.Icon(color="red")
-        ).add_to(m)
+    return total_distance, total_duration
 
-        # Calculate Original Route
+
+def calculate_roundtrip(graph, start_point, waypoints, closures, max_attempts=10):
+    working_graph = graph.copy()
+    points = [start_point] + waypoints + [start_point]
+    total_dist = 0
+    total_time = 0
+    all_routes = []
+
+    # Remove closure edges
+    for closure in closures:
+        node = closure["node_id"]
+        if node in working_graph:
+            working_graph.remove_edges_from(list(working_graph.edges(node)))
+
+    for i in range(len(points)-1):
+        orig = points[i]
+        dest = points[i+1]
+
         try:
             orig_node = ox.distance.nearest_nodes(
-                road_network, point_a[1], point_a[0])
+                working_graph, orig[1], orig[0])
             dest_node = ox.distance.nearest_nodes(
-                road_network, point_b[1], point_b[0])
+                working_graph, dest[1], dest[0])
+            route = nx.shortest_path(
+                working_graph, orig_node, dest_node, weight="length")
 
-            original_route = nx.shortest_path(
-                road_network, orig_node, dest_node, weight="length"
-            )
-            route_coords_original = [
-                (road_network.nodes[node]["y"], road_network.nodes[node]["x"]) for node in original_route
-            ]
-            folium.PolyLine(
-                route_coords_original,
-                color="blue",
-                weight=5,
-                opacity=0.7,
-                popup=f"Original Route for Placekey {row['Placekey']}"
-            ).add_to(m)
+            leg_dist, leg_time = calculate_route_metrics(working_graph, route)
+            total_dist += leg_dist
+            total_time += leg_time
+            all_routes.append(route)
 
-            # Calculate distance and duration using OSRM
-            coords = f"{point_a[1]},{point_a[0]};{point_b[1]},{point_b[0]}"
-            response = requests.get(f"{OSRM_BASE_URL}/{coords}?overview=full")
-            if response.status_code == 200:
-                data = response.json()
-                distance = data["routes"][0]["distance"]
-                duration = data["routes"][0]["duration"]
-
-                print(
-                    f"Original Route: Distance = {distance:.2f} meters, Duration = {duration/60:.2f} minutes")
-
-            else:
-                print(f"Failed to fetch OSRM data: {response.status_code}")
-
-        except Exception as e:
-            print(f"Failed to compute original route: {e}")
-            continue
-
-        # Alternate route calculation
-try:
-    current_route = original_route
-    max_attempts = 5
-    attempts = 0
-
-    while attempts < max_attempts:
-        print(f"Attempt {attempts + 1}: Checking closures...")
-        affected = False
-        for closure_node in closure_nodes:
-            node_id = closure_node.get("node_id")
-            if node_id is None:
-                continue
-
-            if node_id in current_route:
-                edges_to_remove = list(road_network.edges(node_id))
-                for edge in edges_to_remove:
-                    road_network.remove_edge(*edge)
-                    affected = True
-                print(f"Removed edges for closure node: {node_id}")
-
-        if not affected:
-            print("No further closures affecting the route.")
-            break
-
-        try:
-            current_route = nx.shortest_path(
-                road_network, orig_node, dest_node, weight="length"
-            )
-            print(
-                f"Recalculated alternate route after {attempts + 1} attempts.")
         except nx.NetworkXNoPath:
-            print("No alternate route found. Exiting loop.")
-            current_route = None
-            break
+            return None, None, None
 
-        attempts += 1
+    return total_dist, total_time, all_routes
 
-    if current_route:
-        route_coords_alternate = [
-            (road_network.nodes[node]["y"], road_network.nodes[node]["x"]) for node in current_route
-        ]
+
+def visualize_route(m, graph, routes, color):
+    for i, route in enumerate(routes):
+        coords = [(graph.nodes[node]["y"], graph.nodes[node]["x"])
+                  for node in route]
         folium.PolyLine(
-            route_coords_alternate,
-            color="black",
-            weight=5,
+            coords,
+            color=color,
+            weight=3,
             opacity=0.7,
-            popup=f"Alternate Route for Placekey {row['Placekey']}"
+            popup=f"Leg {i+1}"
         ).add_to(m)
 
-        # Calculate distance and duration for the alternate route
-        # Format the full path of the alternate route for OSRM
-        osrm_coords = ";".join(f"{lon},{lat}" for lat,
-                               lon in route_coords_alternate)
-        response = requests.get(
-            f"{OSRM_BASE_URL}/{osrm_coords}?overview=false"
-        )
-        if response.status_code == 200:
-            if "routes" in data and len(data["routes"]) > 0:
-                alt_distance = data["routes"][0]["distance"]
-                alt_duration = data["routes"][0]["duration"]
-                print(
-                    f"Alternate Route: Distance = {alt_distance:.2f} meters, Duration = {alt_duration/60:.2f} minutes")
-            else:
-                print("OSRM response did not contain valid route information.")
-        else:
-            print(
-                f"Failed to fetch OSRM data for alternate route: {response.status_code}")
-    else:
-        print(
-            f"No valid alternate route found for Placekey {row['Placekey']} after {attempts} attempts.")
 
-except Exception as e:
-    print(
-        f"Error while processing alternate route for Placekey {row['Placekey']}: {e}")
+def main():
+    road_network, closures, tract_data, placekeys = load_data()
+    results = []
 
+    # Initialize map
+    m = folium.Map(location=[41.8781, -87.6298], zoom_start=11)
 
-# Step 9: Add Road Closures to Map
-print("Adding road closures to map...")
-
-for closure_node in closure_nodes:
-    try:
-        # Extract the node ID
-        node_id = closure_node.get("node_id")
-        if node_id is None:
-            print(f"Node ID not found in closure_node: {closure_node}")
+    # Process GEOIDs
+    for geoid in tqdm(tract_data['GEOID'].unique()[:5], desc="Processing GEOIDs"):
+        tract_row = tract_data[tract_data['GEOID'] == geoid]
+        if tract_row.empty:
             continue
 
-        # Get latitude and longitude of the node from the road network
-        latitude = road_network.nodes[node_id]["y"]
-        longitude = road_network.nodes[node_id]["x"]
+        centroid = get_centroid(tract_row)
+        start_point = (centroid.y, centroid.x)
 
-        # Add a marker for the road closure
-        folium.CircleMarker(
-            location=(latitude, longitude),
-            radius=10,
-            color="red",
-            fill=True,
-            fill_color="red",
-            fill_opacity=0.9,
-            popup=f"Road Closure: Node {node_id}",
-        ).add_to(m)
+        # Get placekey pairs
+        for i in range(0, len(placekeys)-1, 2):
+            pk1 = placekeys.iloc[i]
+            pk2 = placekeys.iloc[i+1]
+            waypoints = [
+                (pk1["Latitude"], pk1["Longitude"]),
+                (pk2["Latitude"], pk2["Longitude"])
+            ]
 
-    except KeyError as e:
-        print(
-            f"Error accessing node attributes for closure node {closure_node}: {e}")
-    except Exception as e:
-        print(f"Unexpected error for closure node {closure_node}: {e}")
+            # Calculate routes
+            orig_dist, orig_time, orig_routes = calculate_roundtrip(
+                road_network, start_point, waypoints, []
+            )
+
+            alt_dist, alt_time, alt_routes = calculate_roundtrip(
+                road_network, start_point, waypoints, closures
+            )
+
+            if orig_routes and alt_routes:
+                # Add to results
+                results.append({
+                    "GEOID": geoid,
+                    "Placekey1": pk1["Placekey"],
+                    "Placekey2": pk2["Placekey"],
+                    "Original_Distance_km": round(orig_dist/1000, 2),
+                    "Original_Time_min": round(orig_time, 1),
+                    "Alternate_Distance_km": round(alt_dist/1000, 2),
+                    "Alternate_Time_min": round(alt_time, 1),
+                    "Distance_Diff_km": round((alt_dist - orig_dist)/1000, 2),
+                    "Time_Diff_min": round(alt_time - orig_time, 1)
+                })
+
+                # Visualize
+                visualize_route(m, road_network, orig_routes, "blue")
+                visualize_route(m, road_network, alt_routes, "red")
+
+    # Save outputs
+    m.save(OUTPUT_MAP)
+    pd.DataFrame(results).to_excel(OUTPUT_EXCEL, index=False)
+    print(f"Map saved to {OUTPUT_MAP}")
+    print(f"Results saved to {OUTPUT_EXCEL}")
 
 
-# Step 10: Save Map
-output_map_path = "routes_with_geoid_and_placekeys.html"
-m.save(output_map_path)
-print(f"Map saved as {output_map_path}.")
+if __name__ == "__main__":
+    main()
